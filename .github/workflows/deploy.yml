@@ -1,0 +1,100 @@
+name: Infrastructure Management
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      action:
+        description: 'Select action'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+jobs:
+  infrastructure:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    env:
+      DOCKER_USER: ${{ secrets.DOCKER_USER }}
+      DOCKER_PASS: ${{ secrets.DOCKER_PASS }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ github.event.inputs.environment == 'dev' && 'us-east-1' || 'us-west-2' }}
+      TF_ENVIRONMENT: ${{ github.event.inputs.environment }}
+      IMAGE_NAME: "simpletimeservice"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      if: inputs.action != 'destroy'
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Set up Docker Buildx
+      if: inputs.action != 'destroy'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      if: inputs.action != 'destroy'
+      run: echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+
+    - name: Build and Push Image
+      if: inputs.action != 'destroy'
+      working-directory: ./app
+      run: |
+        docker build -t $DOCKER_USER/$IMAGE_NAME:$TF_ENVIRONMENT .
+        docker push $DOCKER_USER/$IMAGE_NAME:$TF_ENVIRONMENT
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.6
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: terraform init -backend-config="key=$TF_ENVIRONMENT/terraform.tfstate"
+
+    - name: Terraform Plan (Normal)
+      if: inputs.action == 'plan'
+      working-directory: ./terraform
+      run: |
+        terraform plan \
+          -var="container_image=$DOCKER_USER/$IMAGE_NAME:$TF_ENVIRONMENT" \
+          -var="aws_region=$AWS_REGION"
+
+    - name: Terraform Apply
+      if: inputs.action == 'apply'
+      working-directory: ./terraform
+      run: |
+        terraform apply -auto-approve \
+          -var="container_image=$DOCKER_USER/$IMAGE_NAME:$TF_ENVIRONMENT" \
+          -var="aws_region=$AWS_REGION"
+
+    - name: Terraform Plan (Destroy)
+      if: inputs.action == 'destroy'
+      working-directory: ./terraform
+      id: destroy-plan
+      run: |
+        terraform plan -destroy \
+          -var="container_image=dummy" \
+          -var="aws_region=$AWS_REGION" \
+          -out=tfdestroyplan
+        echo "PLAN_EXIT_CODE=$?" >> $GITHUB_OUTPUT
+
+    - name: Terraform Destroy
+      if: inputs.action == 'destroy' && steps.destroy-plan.outputs.PLAN_EXIT_CODE == 0
+      working-directory: ./terraform
+      run: terraform apply -auto-approve tfdestroyplan
